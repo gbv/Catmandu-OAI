@@ -19,6 +19,9 @@ has until   => (is => 'ro');
 has oai     => (is => 'ro', lazy => 1, builder => 1);
 has dry     => (is => 'ro');
 has listIdentifiers => (is => 'ro');
+has ids     => (is => 'ro', coerce => sub { 
+        ref $_[0] ? $_[0] : [split ',', $_[0]] 
+});
 
 sub _build_handler {
     my ($self) = @_;
@@ -61,8 +64,18 @@ sub _build_oai {
     HTTP::OAI::Harvester->new(baseURL => $self->url, resume => 0);
 }
 
-sub _map_record {
+sub _handle_record {
     my ($self, $rec) = @_;
+
+    if (!$rec) {
+        return;
+    } elsif(!$rec->isa('HTTP::OAI::Record')) {
+        return {
+            _id => $rec->identifier,
+            _datestamp  => $rec->datestamp,
+            _status => $rec->status // "",
+        }
+    }
 
     my $sets       = [ $rec->header->setSpec ];
     my $identifier = $rec->identifier;
@@ -82,17 +95,15 @@ sub _map_record {
                 ? $self->handler->parse($dom) : $self->handler->($dom)) // { };
     }
 
-    my $data = {
-        _id => $identifier ,
-        _identifier => $identifier ,
-        _datestamp  => $datestamp ,
-        _status     => $status ,
-        _setSpec    => $sets ,
-        _about      => $about ,
+    return {
+        _id         => $identifier,
+        _identifier => $identifier,
+        _datestamp  => $datestamp,
+        _status     => $status,
+        _setSpec    => $sets,
+        _about      => $about,
         %$values
     };
-
-    $data;
 }
 
 sub _args {
@@ -112,6 +123,34 @@ sub _args {
     return %args;
 }
 
+sub ids_run {
+    my ($self) = @_;
+    sub {
+        state $ids = $self->ids;
+        state $counter = @$ids;
+        return unless $counter--;
+
+        my $args = {
+            identifier => $ids->[@$ids-$counter-1],
+            $self->_args
+        };
+
+        if ($self->dry) {
+            return {
+                url => $self->oai->_buildurl( %$args, verb => 'GetRecord' )
+            }
+        }
+
+        my $res = $self->oai->GetRecord(%$args)->next;
+        if ($res->is_error) {
+            $self->log->error($res->message);
+            return;
+        }
+
+        return $self->_handle_record($res);
+    }
+}
+
 sub dry_run {
     my ($self) = @_;
     sub {
@@ -119,16 +158,14 @@ sub dry_run {
         return if $called;
         $called = 1;
         # TODO: make sure that HTTP::OAI does not change this internal method
-        return { 
-            url => $self->oai->_buildurl( 
-                $self->_args, 
-                verb => ($self->listIdentifiers ? 'ListIdentifiers' : 'ListRecords')
-            )
-        };
+        return { url => $self->oai->_buildurl( 
+            $self->_args, 
+            verb => ($self->listIdentifiers ? 'ListIdentifiers' : 'ListRecords')
+        )}
     };
 }
 
-sub oai_run {
+sub list_run {
     my ($self) = @_;
     sub {
         state $stack = [];
@@ -167,25 +204,19 @@ sub oai_run {
             }
         }
 
-        if (my $rec = shift @$stack) {
-            if ($rec->isa('HTTP::OAI::Record')) {
-                return $self->_map_record($rec);
-            } else {
-                return {
-                    _id => $rec->identifier,
-                    _datestamp  => $rec->datestamp,
-                    _status => $rec->status // "",
-                }
-            }
-        }
-
-        return undef;
+        return $self->_handle_record(shift @$stack);
     };
 }
 
 sub generator {
     my ($self) = @_;
-    return $self->dry ? $self->dry_run : $self->oai_run;
+    if ($self->ids) {
+        return $self->ids_run;
+    } elsif($self->dry) {
+        return $self->dry_run;
+    } else {
+        $self->list_run;
+    }
 }
 
 =head1 NAME
@@ -251,9 +282,13 @@ field C<_metadata>.
 
 =item until
 
+=item ids
+
+Array reference or comma-separated list with OAI identifiers to query for
+
 =item listIdentifiers
 
-Harvest identifiers instead of full records.
+Harvest identifiers instead of full records
 
 =item dry
 
